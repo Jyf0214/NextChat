@@ -1,110 +1,102 @@
-name: Release App
+name: Install Alist and Sync Data
 
 on:
-  workflow_dispatch:
-  release:
-    types: [published]
+  workflow_dispatch: # 允许手动触发
+  # push: # 或者在推送到特定分支时触发
+  #   branches:
+  #     - main # 例如，推送到 main 分支时触发
 
 jobs:
-  create-release:
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    outputs:
-      release_id: ${{ steps.create-release.outputs.result }}
+  sync-alist-data:
+    runs-on: ubuntu-latest # 使用最新的 Ubuntu Runner
 
     steps:
-      - uses: actions/checkout@v3
-      - name: setup node
-        uses: actions/setup-node@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
-          node-version: 18
-      - name: get version
-        run: echo "PACKAGE_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').package.version")" >> $GITHUB_ENV
-      - name: create release
-        id: create-release
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const { data } = await github.rest.repos.getLatestRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-            })
-            return data.id
+          # Fetch all history so we can push back later
+          fetch-depth: 0
+          # Persist credentials for subsequent Git operations
+          persist-credentials: true
 
-  build-tauri:
-    needs: create-release
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - os: ubuntu-latest
-            arch: x86_64
-            rust_target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            arch: aarch64
-            rust_target: x86_64-apple-darwin,aarch64-apple-darwin
-          - os: windows-latest
-            arch: x86_64
-            rust_target: x86_64-pc-windows-msvc
-
-    runs-on: ${{ matrix.config.os }}
-    steps:
-      - uses: actions/checkout@v3
-      - name: setup node
-        uses: actions/setup-node@v3
-        with:
-          node-version: 18
-          cache: 'yarn'
-      - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.config.rust_target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.config.os }}
-      - name: install dependencies (ubuntu only)
-        if: matrix.config.os == 'ubuntu-latest'
+      - name: Set up Alist Data Directory
+        id: paths
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libappindicator3-dev librsvg2-dev patchelf
-      - name: install frontend dependencies
-        run: yarn install # change this to npm or pnpm depending on which one you use
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        with:
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          args: ${{ matrix.config.os == 'macos-latest' && '--target universal-apple-darwin' || '' }}
+          # 定义 Alist 数据存储在仓库中的路径
+          DATA_DIR="./alist-data"
+          echo "data_dir=${DATA_DIR}" >> $GITHUB_OUTPUT
+          # 确保数据目录存在
+          mkdir -p $DATA_DIR
+          echo "Created data directory at ${DATA_DIR}"
 
-  publish-release:
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    needs: [create-release, build-tauri]
+      - name: Download and Extract Latest Alist
+        run: |
+          # 从 GitHub Releases API 获取最新的 Linux AMD64 版本 URL
+          LATEST_URL=$(curl -s https://api.github.com/repos/alist-org/alist/releases/latest | jq -r '.assets[] | select(.name | contains("linux-amd64")) | .browser_download_url')
 
-    steps:
-      - name: publish release
-        id: publish-release
-        uses: actions/github-script@v6
-        env:
-          release_id: ${{ needs.create-release.outputs.release_id }}
-        with:
-          script: |
-            github.rest.repos.updateRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: process.env.release_id,
-              draft: false,
-              prerelease: false
-            })
+          if [ -z "$LATEST_URL" ]; then
+            echo "Error: Could not find the latest Alist release URL for linux-amd64."
+            exit 1
+          fi
+
+          echo "Downloading Alist from $LATEST_URL"
+          wget -q -O alist.tar.gz "$LATEST_URL"
+
+          echo "Extracting Alist..."
+          tar -xzf alist.tar.gz
+          chmod +x alist
+          echo "Alist binary ready."
+          ./alist version # 打印版本信息
+
+      - name: Run Alist (Optional - Initialization or Task)
+        run: |
+          DATA_DIR="${{ steps.paths.outputs.data_dir }}"
+          echo "Running Alist briefly to ensure data directory structure (if needed)..."
+          # 尝试在后台运行 Alist，指定数据目录
+          # 注意：这只是短暂运行，例如为了生成初始配置文件（如果它不存在）
+          # 它不会作为一个持续的服务运行。
+          # 你可以根据需要调整这里的命令，例如运行 'alist admin' 获取信息
+          ./alist server --data "$DATA_DIR" &
+          ALIST_PID=$!
+          echo "Alist started with PID $ALIST_PID. Waiting a few seconds..."
+          sleep 15 # 给 Alist 一点时间来初始化或写入文件
+
+          # 尝试获取管理员信息 (如果配置文件已存在且设置了密码，这可能不会显示密码)
+          echo "Attempting to get admin info:"
+          ./alist admin --data "$DATA_DIR" || echo "Could not get admin info (maybe not set yet)."
+
+          echo "Stopping Alist (PID $ALIST_PID)..."
+          kill $ALIST_PID || echo "Alist process $ALIST_PID not found or already stopped."
+          sleep 5 # 确保进程已停止
+          echo "Alist process should be stopped."
+          # 如果 Alist 产生了你不希望提交的临时文件（如 .sock 文件），在这里清理它们
+          # find "$DATA_DIR" -name "*.sock" -delete
+
+      - name: Commit and Push Alist Data
+        run: |
+          DATA_DIR="${{ steps.paths.outputs.data_dir }}"
+          echo "Configuring Git..."
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # 获取当前分支名称
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          echo "Current branch: $BRANCH_NAME"
+
+          # 拉取最新更改，以防在工作流运行期间有其他提交
+          git pull origin $BRANCH_NAME
+
+          echo "Checking for changes in $DATA_DIR..."
+          git add "$DATA_DIR"
+
+          # 检查是否有暂存的更改
+          if git diff --staged --quiet; then
+            echo "No changes detected in $DATA_DIR. Nothing to commit."
+          else
+            echo "Changes detected in $DATA_DIR. Committing and pushing..."
+            git commit -m "Sync Alist data [skip ci]" # 添加 [skip ci] 防止触发自身 (如果触发器是 on:push)
+            echo "Pushing changes to origin/$BRANCH_NAME..."
+            # 使用 GITHUB_TOKEN 推送回仓库
+            git push origin $BRANCH_NAME
+            echo "Alist data successfully pushed to repository."
+          fi
